@@ -355,6 +355,10 @@ async function fetchBoardData() {
       liveData.techs    = data.techs    || [];
       liveData.settings = data.settings || { annualGoal:0, convGoal:65 };
       liveData.lastSync = data.lastSync;
+      // Effective year/month for buffer-aware display (falls back to today)
+      var __today = new Date();
+      liveData.effectiveYear  = (typeof data.effectiveYear  === "number") ? data.effectiveYear  : __today.getFullYear();
+      liveData.effectiveMonth = (typeof data.effectiveMonth === "number") ? data.effectiveMonth : __today.getMonth();
       liveData.loaded   = true;
       document.getElementById('footerNote').textContent =
         '⟳ Last sync: ' + (data.lastSync ? new Date(data.lastSync).toLocaleTimeString() : 'Unknown') +
@@ -386,9 +390,9 @@ function loadFromLocalStorage() {
 
 // ── PAGE ROTATION ──
 const PAGE1_DURATION = 30000; // 30 seconds on page 1
-const PAGE2_DURATION = 15000; // 15 seconds on page 2
+const PAGE2_DURATION = 30000; // 30 seconds on page 2 (was 15s — equal time per page)
 const FADE_DURATION  = 800;   // 0.8s fade transition
-const MAX_PAGE1      = 12;    // show all on page 1 if 12 or fewer techs
+const MAX_PAGE1      = 10;    // page 1 = top 10; page 2 = the rest (was 12)
 
 let currentPage    = 1;
 let totalPages     = 1;
@@ -479,15 +483,20 @@ function render(){
   if (!liveData.loaded) return; // wait for data
 
   const today=new Date();today.setHours(0,0,0,0);
-  const year=today.getFullYear(),month=today.getMonth();
+  // Effective year/month for data display (handles 2-day buffer).
+  const year  = (typeof liveData.effectiveYear  === "number") ? liveData.effectiveYear  : today.getFullYear();
+  const month = (typeof liveData.effectiveMonth === "number") ? liveData.effectiveMonth : today.getMonth();
   const holMap=getHolidayMap(year);
   const weeks=getWeeksForMonth(year,month);
-  const curWkIdx=getCurWkIdx(weeks,today);
+  // During buffer, today is in NEW month but we display PREVIOUS;
+  // pin curWkIdx to last week so future-week styling doesn't kick in.
+  const inEffectiveMonth = (today.getFullYear()===year && today.getMonth()===month);
+  const curWkIdx = inEffectiveMonth ? getCurWkIdx(weeks,today) : weeks.length - 1;
 
   const annualGoal = liveData.settings.annualGoal || 0;
   const convGoal   = liveData.settings.convGoal   || 65;
 
-  document.getElementById('dateMain').textContent=`${MONTHS[month]} ${today.getDate()}, ${year}`;
+  document.getElementById('dateMain').textContent=`${MONTHS[today.getMonth()]} ${today.getDate()}, ${today.getFullYear()}`;
   document.getElementById('dateSub').textContent=DAYS[today.getDay()];
   document.getElementById('monthTag').textContent=MONTHS[month]+' '+year;
 
