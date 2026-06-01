@@ -378,21 +378,40 @@ function loadFromLocalStorage() {
   liveData.loaded = true;
 }
 
-// ── PAGE ROTATION ──
-const PAGE1_DURATION = 30000; // 30 seconds on page 1
-const PAGE2_DURATION = 30000; // 30 seconds on page 2 (was 15s — equal time per page)
-const FADE_DURATION  = 800;   // 0.8s fade transition
-const MAX_PAGE1      = 10;    // page 1 = top 10; page 2 = the rest (was 12)
+// ── PAGE ROTATION (dynamic duration) ──
+// Each page's dwell time = PAGE_BASE_MS + (PAGE_PER_TECH_MS × techs on that page).
+// e.g., 10 techs → 10s + 40s = 50s; 5 techs → 10s + 20s = 30s.
+const PAGE_BASE_MS     = 10000;
+const PAGE_PER_TECH_MS = 4000;
+const FADE_DURATION    = 800;
+const MAX_PAGE1        = 10;    // page 1 = top 10; page 2 = the rest
 
-let currentPage    = 1;
-let totalPages     = 1;
-let pageTimer      = null;
-let progressTimer  = null;
-let progressStart  = null;
+// Legacy aliases (downstream code still references these — keep them in sync)
+const PAGE1_DURATION = PAGE_BASE_MS + (PAGE_PER_TECH_MS * MAX_PAGE1);
+const PAGE2_DURATION = PAGE1_DURATION; // safe fallback when page-2 count unknown
+
+let currentPage      = 1;
+let totalPages       = 1;
+let pageTimer        = null;
+let progressTimer    = null;
+let progressStart    = null;
 let progressDuration = PAGE1_DURATION;
+
+// Per-page tech counts populated by startPageRotation so scheduleNextPage can compute duration.
+let page1Count       = 0;
+let page2Count       = 0;
+
+function getPageDuration(pageNum) {
+  var n = pageNum === 1 ? page1Count : page2Count;
+  return PAGE_BASE_MS + (PAGE_PER_TECH_MS * n);
+}
 
 function startPageRotation(numTechs) {
   totalPages = numTechs > MAX_PAGE1 ? 2 : 1;
+
+  // Cache the counts for dynamic-duration math
+  page1Count = Math.min(numTechs, MAX_PAGE1);
+  page2Count = totalPages > 1 ? (numTechs - MAX_PAGE1) : 0;
 
   // Show/hide page 2 dot
   const dot2 = document.getElementById('dot2');
@@ -410,7 +429,7 @@ function startPageRotation(numTechs) {
 
 function scheduleNextPage() {
   if (pageTimer) clearTimeout(pageTimer);
-  const duration = currentPage === 1 ? PAGE1_DURATION : PAGE2_DURATION;
+  const duration = getPageDuration(currentPage);
   progressDuration = duration;
   startProgressBar(duration);
   pageTimer = setTimeout(function() {
