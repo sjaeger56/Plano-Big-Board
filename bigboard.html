@@ -339,6 +339,8 @@ let liveData = {
   settings: { annualGoal:0, convGoal:65, monthlyGoals:{}, companyYTD:0, companyMonthly:0 },
   lastSync: null,
   loaded:   false,
+  plumbingService:   { techs: [], companyYtdRev: 0, companyMonthlyRev: 0 },
+  plumbingInstaller: { techs: [], companyYtdRev: 0, companyMonthlyRev: 0 },
 };
 
 // ── FETCH LIVE DATA FROM GOOGLE SHEET ──
@@ -355,6 +357,9 @@ async function fetchBoardData() {
       liveData.techs    = data.techs    || [];
       liveData.settings = data.settings || { annualGoal:0, convGoal:65 };
       liveData.lastSync = data.lastSync;
+      // Capture the new section arrays (Service and Installer)
+      liveData.plumbingService   = data.plumbingService   || { techs:[], companyYtdRev:0, companyMonthlyRev:0 };
+      liveData.plumbingInstaller = data.plumbingInstaller || { techs:[], companyYtdRev:0, companyMonthlyRev:0 };
       // Effective year/month for buffer-aware display (falls back to today)
       var __today = new Date();
       liveData.effectiveYear  = (typeof data.effectiveYear  === "number") ? data.effectiveYear  : __today.getFullYear();
@@ -388,73 +393,133 @@ function loadFromLocalStorage() {
   liveData.loaded = true;
 }
 
-// ── PAGE ROTATION (dynamic duration) ──
-// Each page's dwell time = PAGE_BASE_MS + (PAGE_PER_TECH_MS × techs on that page).
-// e.g., 10 techs → 10s + 40s = 50s; 5 techs → 10s + 20s = 30s.
+// ── SECTION ROTATION (Plumbing Service ↔ Plumbing Installer) ──
+// Each section can split into up to 2 sub-pages (MAX_PAGE1 techs on page 1,
+// the rest on page 2). The rotation cycle iterates through all populated
+// sub-pages across both sections, then loops back to the top.
+//
+// Per-page dwell time = PAGE_BASE_MS + (PAGE_PER_TECH_MS × techs on that page).
 const PAGE_BASE_MS     = 10000;
 const PAGE_PER_TECH_MS = 4000;
 const FADE_DURATION    = 800;
-const MAX_PAGE1        = 10;    // page 1 = top 10; page 2 = the rest
+const MAX_PAGE1        = 10;    // top-10 on sub-page 1; the rest on sub-page 2
 
-// Legacy aliases (downstream code still references these — keep them in sync)
-const PAGE1_DURATION = PAGE_BASE_MS + (PAGE_PER_TECH_MS * MAX_PAGE1);
-const PAGE2_DURATION = PAGE1_DURATION; // safe fallback when page-2 count unknown
+const SECTIONS = ['plumbingService', 'plumbingInstaller'];
+const SECTION_TITLES = {
+  plumbingService:   'Plumbing Service',
+  plumbingInstaller: 'Plumbing Installer',
+};
 
-let currentPage      = 1;
-let totalPages       = 1;
+// Rotation state — a flat queue of {section, subPage, techsOnPage} entries.
+let rotationQueue    = [];
+let rotationIndex    = 0;
 let pageTimer        = null;
 let progressTimer    = null;
 let progressStart    = null;
-let progressDuration = PAGE1_DURATION;
+let progressDuration = PAGE_BASE_MS;
 
-// Per-page tech counts populated by render() so scheduleNextPage can compute duration.
-let page1Count       = 0;
-let page2Count       = 0;
-
-function getPageDuration(pageNum) {
-  var n = pageNum === 1 ? page1Count : page2Count;
-  return PAGE_BASE_MS + (PAGE_PER_TECH_MS * n);
+function getPageDuration(techsOnPage) {
+  return PAGE_BASE_MS + (PAGE_PER_TECH_MS * techsOnPage);
 }
 
-function startPageRotation(numTechs) {
-  totalPages = numTechs > MAX_PAGE1 ? 2 : 1;
-
-  // Cache the counts for dynamic-duration math
-  page1Count = Math.min(numTechs, MAX_PAGE1);
-  page2Count = totalPages > 1 ? (numTechs - MAX_PAGE1) : 0;
-
-  // Show/hide page 2 dot
-  const dot2 = document.getElementById('dot2');
-  if (dot2) dot2.style.display = totalPages > 1 ? 'block' : 'none';
-
-  if (totalPages === 1) {
-    updatePageIndicator();
-    return; // No rotation needed
+// Build the rotation queue from both sections. Skips a section entirely
+// if it has 0 techs. Splits into up to 2 sub-pages if a section exceeds
+// MAX_PAGE1.
+function buildRotationQueue() {
+  rotationQueue = [];
+  SECTIONS.forEach(function(sectionKey) {
+    var section = liveData[sectionKey];
+    if (!section || !section.techs || section.techs.length === 0) return;
+    var count = section.techs.length;
+    var page1Count = Math.min(count, MAX_PAGE1);
+    rotationQueue.push({ section: sectionKey, subPage: 1, techsOnPage: page1Count });
+    if (count > MAX_PAGE1) {
+      rotationQueue.push({ section: sectionKey, subPage: 2, techsOnPage: count - MAX_PAGE1 });
+    }
+  });
+  // Fallback: if both sections are empty, render whatever's in the combined
+  // techs array as a single "Plumbing Service" page so the board isn't blank.
+  if (rotationQueue.length === 0 && liveData.techs && liveData.techs.length > 0) {
+    var count = liveData.techs.length;
+    var page1Count = Math.min(count, MAX_PAGE1);
+    rotationQueue.push({ section: 'plumbingService', subPage: 1, techsOnPage: page1Count });
+    if (count > MAX_PAGE1) {
+      rotationQueue.push({ section: 'plumbingService', subPage: 2, techsOnPage: count - MAX_PAGE1 });
+    }
   }
+}
 
-  // Start on page 1
-  showPage(1);
-  scheduleNextPage();
+function startPageRotation() {
+  buildRotationQueue();
+  if (rotationQueue.length === 0) return;
+  rotationIndex = 0;
+  showCurrentSlot();
+  if (rotationQueue.length > 1) scheduleNextPage();
 }
 
 function scheduleNextPage() {
   if (pageTimer) clearTimeout(pageTimer);
-  const duration = getPageDuration(currentPage);
+  var slot = rotationQueue[rotationIndex];
+  var duration = getPageDuration(slot.techsOnPage);
   progressDuration = duration;
   startProgressBar(duration);
   pageTimer = setTimeout(function() {
-    const nextPage = currentPage === 1 ? 2 : 1;
-    showPage(nextPage);
+    rotationIndex = (rotationIndex + 1) % rotationQueue.length;
+    showCurrentSlot();
     scheduleNextPage();
   }, duration);
 }
 
+// Render the current slot: rebuild the two tbody's from the section's techs,
+// update the title suffix, and show the correct sub-page.
+function showCurrentSlot() {
+  var slot = rotationQueue[rotationIndex];
+  var section = liveData[slot.section];
+  if (!section) return;
+
+  // Update the table title to include the section name
+  var titleEl = document.querySelector('.table-title');
+  if (titleEl) {
+    titleEl.textContent = 'Technician Scorecard — ' + SECTION_TITLES[slot.section] +
+                          ' — Ranked by Monthly Revenue';
+  }
+
+  // Rebuild both sub-pages for this section (in case section changed)
+  populatePagesForSection(section.techs);
+
+  // Show the correct sub-page
+  showPage(slot.subPage);
+
+  // Update section indicator (uses page dots but reflects section+subpage)
+  updateSectionIndicator();
+}
+
+function populatePagesForSection(techs) {
+  var sorted = [...techs].sort(function(a,b) { return (b.monthlyRev||0) - (a.monthlyRev||0); });
+  var page1Techs = sorted.length > MAX_PAGE1 ? sorted.slice(0, MAX_PAGE1) : sorted;
+  var page2Techs = sorted.length > MAX_PAGE1 ? sorted.slice(MAX_PAGE1) : [];
+
+  buildTableHead('tableHead1');
+  if (page2Techs.length > 0) buildTableHead('tableHead2');
+
+  var tbody1 = document.getElementById('techBody1');
+  var tbody2 = document.getElementById('techBody2');
+  if (tbody1) tbody1.innerHTML = '';
+  if (tbody2) tbody2.innerHTML = '';
+
+  page1Techs.forEach(function(t, i) {
+    var tr = buildRow(t, i, i+1);
+    if (tbody1) tbody1.appendChild(tr);
+  });
+  page2Techs.forEach(function(t, i) {
+    var tr = buildRow(t, i, MAX_PAGE1 + i + 1);
+    if (tbody2) tbody2.appendChild(tr);
+  });
+}
+
 function showPage(pageNum) {
-  currentPage = pageNum;
-
-  const p1 = document.getElementById('page1');
-  const p2 = document.getElementById('page2');
-
+  var p1 = document.getElementById('page1');
+  var p2 = document.getElementById('page2');
   if (pageNum === 1) {
     if (p1) p1.classList.add('active');
     if (p2) p2.classList.remove('active');
@@ -462,33 +527,34 @@ function showPage(pageNum) {
     if (p2) p2.classList.add('active');
     if (p1) p1.classList.remove('active');
   }
-
-  updatePageIndicator();
 }
 
-function updatePageIndicator() {
-  const label = document.getElementById('pageLabel');
-  const dot1  = document.getElementById('dot1');
-  const dot2  = document.getElementById('dot2');
+// Update the page indicator — now shows both section index and sub-page.
+function updateSectionIndicator() {
+  var slot = rotationQueue[rotationIndex];
+  var label = document.getElementById('pageLabel');
+  var dot1  = document.getElementById('dot1');
+  var dot2  = document.getElementById('dot2');
+  var totalSlots = rotationQueue.length;
 
   if (label) {
-    label.textContent = totalPages > 1
-      ? `Page ${currentPage} of ${totalPages}`
-      : '';
+    label.textContent = totalSlots > 1
+      ? SECTION_TITLES[slot.section] + ' · ' + (rotationIndex + 1) + ' of ' + totalSlots
+      : SECTION_TITLES[slot.section];
   }
-  if (dot1) dot1.classList.toggle('active', currentPage === 1);
-  if (dot2) dot2.classList.toggle('active', currentPage === 2);
+  if (dot2) dot2.style.display = totalSlots > 1 ? 'block' : 'none';
+  if (dot1) dot1.classList.toggle('active', slot.subPage === 1);
+  if (dot2) dot2.classList.toggle('active', slot.subPage === 2);
 }
 
 function startProgressBar(duration) {
   if (progressTimer) cancelAnimationFrame(progressTimer);
-  const fill = document.getElementById('pageProgressFill');
+  var fill = document.getElementById('pageProgressFill');
   if (!fill) return;
   progressStart = Date.now();
-
   function step() {
-    const elapsed = Date.now() - progressStart;
-    const pct = Math.min(100, (elapsed / duration) * 100);
+    var elapsed = Date.now() - progressStart;
+    var pct = Math.min(100, (elapsed / duration) * 100);
     fill.style.width = pct + '%';
     if (pct < 100) progressTimer = requestAnimationFrame(step);
   }
@@ -497,49 +563,141 @@ function startProgressBar(duration) {
   progressTimer = requestAnimationFrame(step);
 }
 
+// ── Shared state used by populatePagesForSection ──
+// Populated by render() before rotation starts.
+let __weeks = [];
+let __curWkIdx = -1;
+let __holMap = null;
+let __today = null;
+let __year = null;
+let __convGoal = 65;
+
+function buildTableHead(headId) {
+  var thead = document.getElementById(headId);
+  if (!thead) return;
+  var th = '<th>#</th><th>Technician</th>';
+  __weeks.forEach(function(wk, i) {
+    var isCur = i === __curWkIdx;
+    var wd = countWorkDays(wk.dates, __holMap, null);
+    var hols = holsInWeek(wk.dates, __holMap);
+    th += '<th class="' + (isCur ? 'wkc' : 'wk') + '">Week ' + wk.weekNum +
+          (hols.length ? ' 🎌' : '') +
+          '<br><span style="font-size:8px;font-weight:400;opacity:.7">' + wd + ' work days</span></th>';
+  });
+  th += '<th>Monthly Rev</th><th>Conv %</th><th class="revc">Reviews</th><th class="ytdc">YTD Revenue</th>';
+  thead.innerHTML = th;
+}
+
+function buildRow(t, i, globalRank) {
+  var rank      = globalRank;
+  var color     = COLORS[i % COLORS.length];
+  var ytdRev    = t.ytdRev     || 0;
+  var monthRev  = t.monthlyRev || 0;
+  var conv      = t.convRate   || 0;
+
+  var ytdWD   = countYTDWorkDays(t.startDate, __holMap, __year);
+  var ytdGoal = ytdWD !== null ? t.goal * ytdWD : null;
+  var ytdDiff = ytdGoal !== null ? ytdRev - ytdGoal : null;
+  var ytdCls  = ytdGoal === null ? 'val-muted' : ytdRev >= ytdGoal ? 'val-over' : 'val-under';
+
+  var rh;
+  if (rank === 1) rh = '<span class="rank-badge r1">🥇 1st</span>';
+  else if (rank === 2) rh = '<span class="rank-badge r2">🥈 2nd</span>';
+  else if (rank === 3) rh = '<span class="rank-badge r3">🥉 3rd</span>';
+  else rh = '<span class="rank-badge ro">' + ordinal(rank) + '</span>';
+
+  var elGoal = 0, wkCells = '';
+  __weeks.forEach(function(wk, wi) {
+    var isCur = wi === __curWkIdx, isFut = wi > __curWkIdx;
+    var hols = holsInWeek(wk.dates, __holMap);
+    var holHtml = hols.length ? '<br><span style="font-size:9px;color:#B45309">🎌 ' + hols.join(', ') + '</span>' : '';
+    var wd = isFut ? countWorkDays(wk.dates, __holMap, null) :
+             isCur ? countWorkDays(wk.dates, __holMap, __today) :
+                     countWorkDays(wk.dates, __holMap, null);
+    var wkGoal = t.goal * wd;
+    if (!isFut) elGoal += wkGoal;
+    var rev = t.weeklyRev ? (t.weeklyRev[wk.weekNum] || 0) : 0;
+    if (isFut) {
+      wkCells += '<td' + (isCur ? ' class="cur-wk"' : '') + '><div class="cell-wrap"><span class="cell-main val-muted">—</span><span class="cell-sub">Goal: ' + fmt(wkGoal) + '</span></div></td>';
+    } else if (rev === 0) {
+      wkCells += '<td' + (isCur ? ' class="cur-wk"' : '') + '><div class="cell-wrap"><span class="cell-main val-muted">No data</span><span class="cell-sub">Goal: ' + fmt(wkGoal) + '</span>' + holHtml + '</div></td>';
+    } else {
+      var cls = rev >= wkGoal ? 'val-over' : 'val-under';
+      var diff = rev - wkGoal;
+      wkCells += '<td' + (isCur ? ' class="cur-wk"' : '') + '><div class="cell-wrap"><span class="cell-main ' + cls + '">' + fmt(rev) + '</span><span class="cell-sub">' + fmt(wkGoal) + ' · ' + (diff>=0?'+':'') + fmt(diff) + '</span>' + holHtml + '</div></td>';
+    }
+  });
+
+  var mDiffT = monthRev - elGoal;
+  var mCls   = monthRev === 0 ? 'val-muted' : mDiffT >= 0 ? 'val-over' : 'val-under';
+  var convCls = conv === 0 ? 'val-muted' : conv >= __convGoal ? 'val-over' : 'val-under';
+
+      const revCount = t.reviewCount || 0;
+      const revAvg   = t.reviewAvg   || null;
+      const starsHtml = revAvg !== null
+        ? '★'.repeat(Math.floor(revAvg)) + (revAvg % 1 >= 0.5 ? '☆' : '') + ` ${revAvg.toFixed(1)}`
+        : '';
+      const reviewsCell = `<td class="rev-cell">${revCount>0?`<div class="rev-count">${revCount}</div><div class="rev-stars">${starsHtml}</div>`:'<span class="val-muted">—</span>'}</td>`;
+
+  var ytdHtml = ytdGoal === null
+    ? '<div class="cell-wrap"><span class="ytd-main val-muted">No start date</span></div>'
+    : '<div class="cell-wrap"><span class="ytd-main ' + ytdCls + '">' + fmtK(ytdRev) + '</span><span class="cell-sub">Goal: ' + fmtK(ytdGoal) + ' · ' + (ytdDiff>=0?'+':'') + fmt(ytdDiff) + '</span></div>';
+
+  var tr = document.createElement('tr');
+  tr.innerHTML =
+    '<td>' + rh + '</td>' +
+    '<td><div class="tech-cell"><div class="avatar" style="background:' + color + '18;color:' + color + ';border:2px solid ' + color + '30">' + initials(t.name) + '</div><div><span class="tname">' + t.name + '</span><span class="tgoal">Daily Goal: ' + fmt(t.goal) + '</span></div></div></td>' +
+    wkCells +
+    '<td><div class="cell-wrap"><span class="mrev-main ' + mCls + '">' + (monthRev>0?fmt(monthRev):'—') + '</span>' + (monthRev>0?'<span class="cell-sub">' + (mDiffT>=0?'+':'') + fmt(mDiffT) + ' vs goal</span>':'') + '</div></td>' +
+    '<td><div class="cell-wrap"><span class="conv-main ' + convCls + '">' + (conv>0?conv.toFixed(1)+'%':'—') + '</span>' + (conv>0&&__convGoal?'<span class="cell-sub">Goal: ' + __convGoal + '%</span>':'') + '</div></td>' +
+    reviewsCell +
+    '<td>' + ytdHtml + '</td>';
+  return tr;
+}
+
 // ── RENDER ──
-function render(){
-  if (!liveData.loaded) return; // wait for data
+function render() {
+  if (!liveData.loaded) return;
 
-  const today=new Date();today.setHours(0,0,0,0);
-  // Effective year/month for data display (handles 2-day buffer).
-  const year  = (typeof liveData.effectiveYear  === "number") ? liveData.effectiveYear  : today.getFullYear();
-  const month = (typeof liveData.effectiveMonth === "number") ? liveData.effectiveMonth : today.getMonth();
-  const holMap=getHolidayMap(year);
-  const weeks=getWeeksForMonth(year,month);
-  // During buffer, today is in NEW month but we display PREVIOUS;
-  // pin curWkIdx to last week so future-week styling doesn't kick in.
-  const inEffectiveMonth = (today.getFullYear()===year && today.getMonth()===month);
-  const curWkIdx = inEffectiveMonth ? getCurWkIdx(weeks,today) : weeks.length - 1;
+  __today = new Date(); __today.setHours(0,0,0,0);
+  __year  = (typeof liveData.effectiveYear  === "number") ? liveData.effectiveYear  : __today.getFullYear();
+  var month = (typeof liveData.effectiveMonth === "number") ? liveData.effectiveMonth : __today.getMonth();
+  __holMap = getHolidayMap(__year);
+  __weeks  = getWeeksForMonth(__year, month);
+  var inEffectiveMonth = (__today.getFullYear() === __year && __today.getMonth() === month);
+  __curWkIdx = inEffectiveMonth ? getCurWkIdx(__weeks, __today) : __weeks.length - 1;
 
-  const annualGoal = liveData.settings.annualGoal || 0;
-  const convGoal   = liveData.settings.convGoal   || 65;
+  var annualGoal = liveData.settings.annualGoal || 0;
+  __convGoal = liveData.settings.convGoal || 65;
 
-  document.getElementById('dateMain').textContent=`${MONTHS[today.getMonth()]} ${today.getDate()}, ${today.getFullYear()}`;
-  document.getElementById('dateSub').textContent=DAYS[today.getDay()];
-  document.getElementById('monthTag').textContent=MONTHS[month]+' '+year;
+  document.getElementById('dateMain').textContent = MONTHS[__today.getMonth()] + ' ' + __today.getDate() + ', ' + __today.getFullYear();
+  document.getElementById('dateSub').textContent = DAYS[__today.getDay()];
+  document.getElementById('monthTag').textContent = MONTHS[month] + ' ' + __year;
 
-  // ── COMPANY TOTALS from ST (all completed jobs, not just soldById) ──
-  const coYTDRev     = liveData.settings.companyYTD     || liveData.techs.reduce((s,t) => s + (t.ytdRev||0),     0);
-  const coMonthlyRev = liveData.settings.companyMonthly || liveData.techs.reduce((s,t) => s + (t.monthlyRev||0), 0);
+  // ── SUMMARY BAR — always from Service section totals ──
+  var svc = liveData.plumbingService || { techs: [], companyYtdRev: 0, companyMonthlyRev: 0 };
+  var coYTDRev     = svc.companyYtdRev     || svc.techs.reduce(function(s,t){ return s + (t.ytdRev||0); }, 0);
+  var coMonthlyRev = svc.companyMonthlyRev || svc.techs.reduce(function(s,t){ return s + (t.monthlyRev||0); }, 0);
+  // Fallback for older API responses that didn't provide sections
+  if (coYTDRev === 0 && liveData.techs && liveData.techs.length > 0) {
+    coYTDRev = liveData.techs.reduce(function(s,t){ return s + (t.ytdRev||0); }, 0);
+  }
+  if (coMonthlyRev === 0 && liveData.techs && liveData.techs.length > 0) {
+    coMonthlyRev = liveData.techs.reduce(function(s,t){ return s + (t.monthlyRev||0); }, 0);
+  }
 
-  // Monthly goal — use the specific monthly goal from Admin App settings
-  const monthNum = month + 1; // 1-based
-  const monthlyGoals = liveData.settings.monthlyGoals || {};
-  const coMonthlyGoal = monthlyGoals[monthNum] || monthlyGoals[monthNum.toString()] || 0;
+  var monthNum = month + 1;
+  var monthlyGoals = liveData.settings.monthlyGoals || {};
+  var coMonthlyGoal = monthlyGoals[monthNum] || monthlyGoals[monthNum.toString()] || 0;
 
-  // YTD projected
-  const elWD     = countWorkDaysInYear(holMap, year, true);
-  const totWD    = countWorkDaysInYear(holMap, year, false);
-  const dailyAvg = elWD > 0 ? coYTDRev / elWD : 0;
-  const ytdProj  = Math.round(dailyAvg * totWD);
-  const projVsGoal = annualGoal > 0 ? ytdProj - annualGoal : null;
+  var elWD   = countWorkDaysInYear(__holMap, __year, true);
+  var totWD  = countWorkDaysInYear(__holMap, __year, false);
+  var dailyAvg = elWD > 0 ? coYTDRev / elWD : 0;
+  var ytdProj  = Math.round(dailyAvg * totWD);
+  var projVsGoal = annualGoal > 0 ? ytdProj - annualGoal : null;
+  var mDiff = coMonthlyRev - coMonthlyGoal;
 
-  // Monthly diff
-  const mDiff = coMonthlyRev - coMonthlyGoal;
-
-  // ── SUMMARY BAR ──
-  const sb=document.getElementById('summaryBar');sb.innerHTML='';
+  var sb = document.getElementById('summaryBar'); sb.innerHTML = '';
   [
     {label:'Annual Goal',    value:annualGoal?fmtK(annualGoal):'Not set', cls:'blue'},
     {label:'YTD Revenue',    value:fmtK(coYTDRev), cls:''},
@@ -549,148 +707,24 @@ function render(){
      sub:projVsGoal!==null?(projVsGoal>=0?'▲ '+fmtK(projVsGoal)+' above goal':'▼ '+fmtK(Math.abs(projVsGoal))+' below goal'):'Avg: '+fmt(dailyAvg)+'/day'},
     {label:'Monthly Goal',    value:fmt(Math.round(coMonthlyGoal)), cls:''},
     {label:'Monthly Revenue', value:fmt(coMonthlyRev), cls:mDiff>=0?'pos-c':'neg-c', vc:mDiff>=0?'pos':'neg'},
-    {label:'Monthly +/–',     value:(mDiff>=0?'+':'')+fmt(Math.round(mDiff)), cls:mDiff>=0?'pos-c':'neg-c', vc:mDiff>=0?'pos':'neg'},
-  ].forEach(s=>{
-    sb.innerHTML+=`<div class="sum-card ${s.cls}"><div class="sum-label">${s.label}</div><div class="sum-value ${s.vc||''}">${s.value}</div>${s.sub?`<div class="sum-sub">${s.sub}</div>`:''}</div>`;
+    {label:'Monthly +/-',     value:(mDiff>=0?'+':'')+fmt(Math.round(mDiff)), cls:mDiff>=0?'pos-c':'neg-c', vc:mDiff>=0?'pos':'neg'},
+  ].forEach(function(s) {
+    sb.innerHTML += '<div class="sum-card ' + s.cls + '"><div class="sum-label">' + s.label + '</div><div class="sum-value ' + (s.vc||'') + '">' + s.value + '</div>' + (s.sub?'<div class="sum-sub">' + s.sub + '</div>':'') + '</div>';
   });
-
-  // Table heads built per-page in buildTableHead()
-
-  // ── TECH ROWS ──
-  // Sort by monthly revenue descending
-  const allTechs = [...liveData.techs].sort((a,b) => (b.monthlyRev||0) - (a.monthlyRev||0));
 
   // Holiday footer
-  const mHols=new Set();
-  weeks.forEach(wk=>holsInWeek(wk.dates,holMap).forEach(h=>mHols.add(h)));
-  if(mHols.size) document.getElementById('footerNote').textContent=
-    `⟳ Refreshes hourly  ·  🎌 Holidays this month: ${[...mHols].join(', ')}`;
+  var mHols = new Set();
+  __weeks.forEach(function(wk) { holsInWeek(wk.dates, __holMap).forEach(function(h) { mHols.add(h); }); });
+  if (mHols.size) document.getElementById('footerNote').textContent =
+    '⟳ Refreshes hourly  ·  🎌 Holidays this month: ' + [...mHols].join(', ');
 
-  // ── SPLIT TECHS INTO PAGES ──
-  // Page 1 shows up to MAX_PAGE1 (12) techs, page 2 gets the rest
-  const page1Techs = allTechs.length > MAX_PAGE1 ? allTechs.slice(0, MAX_PAGE1) : allTechs;
-  const page2Techs = allTechs.length > MAX_PAGE1 ? allTechs.slice(MAX_PAGE1) : [];
+  // Remove old single tableHead if present (legacy)
+  var oldHead = document.getElementById('tableHead');
+  if (oldHead) oldHead.innerHTML = '';
 
-  // Build table headers for both pages
-  function buildTableHead(headId) {
-    const thead=document.getElementById(headId);
-    if(!thead) return;
-    let th='<th>#</th><th>Technician</th>';
-    weeks.forEach((wk,i)=>{
-      const isCur=i===curWkIdx;
-      const wd=countWorkDays(wk.dates,holMap,null);
-      const hols=holsInWeek(wk.dates,holMap);
-      th+=`<th class="${isCur?'wkc':'wk'}">Week ${wk.weekNum}${hols.length?' 🎌':''}<br><span style="font-size:8px;font-weight:400;opacity:.7">${wd} work days</span></th>`;
-    });
-    th+='<th>Monthly Rev</th><th>Conv %</th><th class="revc">Reviews</th><th class="ytdc">YTD Revenue</th>';
-    thead.innerHTML=th;
-  }
-  buildTableHead('tableHead1');
-  if(page2Techs.length > 0) buildTableHead('tableHead2');
-
-  const tbody1=document.getElementById('techBody1'); if(tbody1) tbody1.innerHTML='';
-  const tbody2=document.getElementById('techBody2'); if(tbody2) tbody2.innerHTML='';
-
-  // Remove old single tableHead if present
-  const oldHead=document.getElementById('tableHead');
-  if(oldHead) oldHead.innerHTML='';
-
-  function buildRow(t, i, globalRank) {
-    const rank      = globalRank;
-    const color     = COLORS[i % COLORS.length];
-    const ytdRev    = t.ytdRev     || 0;
-    const monthRev  = t.monthlyRev || 0;
-    const conv      = t.convRate   || 0; // real data from ST via Google Sheet
-
-    // YTD goal
-    const ytdWD   = countYTDWorkDays(t.startDate, holMap, year);
-    const ytdGoal = ytdWD !== null ? t.goal * ytdWD : null;
-    const ytdDiff = ytdGoal !== null ? ytdRev - ytdGoal : null;
-    const ytdCls  = ytdGoal === null ? 'val-muted' : ytdRev >= ytdGoal ? 'val-over' : 'val-under';
-    const ytdFrom = t.startDate && new Date(t.startDate) > new Date(year,0,1) ? t.startDate : `${year}-01-01`;
-
-    // Rank badge
-    let rh;
-    if(rank===1)rh=`<span class="rank-badge r1">🥇 1st</span>`;
-    else if(rank===2)rh=`<span class="rank-badge r2">🥈 2nd</span>`;
-    else if(rank===3)rh=`<span class="rank-badge r3">🥉 3rd</span>`;
-    else rh=`<span class="rank-badge ro">${ordinal(rank)}</span>`;
-
-    // Weekly cells — real data from Google Sheet via weeklyRev array
-    let elGoal=0, wkCells='';
-
-    weeks.forEach((wk,wi)=>{
-      const isCur=wi===curWkIdx, isFut=wi>curWkIdx;
-      const hols=holsInWeek(wk.dates,holMap);
-      const holHtml=hols.length?`<br><span style="font-size:9px;color:#B45309">🎌 ${hols.join(', ')}</span>`:'';
-      let wd=isFut?countWorkDays(wk.dates,holMap,null):isCur?countWorkDays(wk.dates,holMap,today):countWorkDays(wk.dates,holMap,null);
-      const wkGoal=t.goal*wd;
-      if(!isFut) elGoal+=wkGoal;
-
-      // weeklyRev is 1-indexed: weeklyRev[1]=week1, weeklyRev[2]=week2 etc
-      const rev = t.weeklyRev ? (t.weeklyRev[wk.weekNum] || 0) : 0;
-
-      if(isFut){
-        wkCells+=`<td${isCur?' class="cur-wk"':''}><div class="cell-wrap"><span class="cell-main val-muted">—</span><span class="cell-sub">Goal: ${fmt(wkGoal)}</span></div></td>`;
-      } else if(rev===0){
-        wkCells+=`<td${isCur?' class="cur-wk"':''}><div class="cell-wrap"><span class="cell-main val-muted">No data</span><span class="cell-sub">Goal: ${fmt(wkGoal)}</span>${holHtml}</div></td>`;
-      } else {
-        const cls=rev>=wkGoal?'val-over':'val-under';
-        const diff=rev-wkGoal;
-        wkCells+=`<td${isCur?' class="cur-wk"':''}><div class="cell-wrap"><span class="cell-main ${cls}">${fmt(rev)}</span><span class="cell-sub">${fmt(wkGoal)} · ${diff>=0?'+':''}${fmt(diff)}</span>${holHtml}</div></td>`;
-      }
-    });
-
-    // Monthly rev color
-    const mDiffT = monthRev - elGoal;
-    const mCls   = monthRev === 0 ? 'val-muted' : mDiffT >= 0 ? 'val-over' : 'val-under';
-
-    // Conv color
-    const convCls = conv === 0 ? 'val-muted' : conv >= convGoal ? 'val-over' : 'val-under';
-
-    // Reviews
-    const revCount = t.reviewCount || 0;
-    const revAvg   = t.reviewAvg   || null;
-    const starsHtml = revAvg !== null
-      ? '★'.repeat(Math.floor(revAvg)) + (revAvg % 1 >= 0.5 ? '☆' : '') + ` ${revAvg.toFixed(1)}`
-      : '';
-
-    // YTD cell
-    const ytdHtml = ytdGoal === null
-      ? `<div class="cell-wrap"><span class="ytd-main val-muted">No start date</span></div>`
-      : `<div class="cell-wrap"><span class="ytd-main ${ytdCls}">${fmtK(ytdRev)}</span><span class="cell-sub">Goal: ${fmtK(ytdGoal)} · ${ytdDiff>=0?'+':''}${fmt(ytdDiff)}</span></div>`;
-
-    const tr=document.createElement('tr');
-    tr.innerHTML=`
-      <td>${rh}</td>
-      <td><div class="tech-cell">
-        <div class="avatar" style="background:${color}18;color:${color};border:2px solid ${color}30">${initials(t.name)}</div>
-        <div><span class="tname">${t.name}</span><span class="tgoal">Daily Goal: ${fmt(t.goal)}</span></div>
-      </div></td>
-      ${wkCells}
-      <td><div class="cell-wrap"><span class="mrev-main ${mCls}">${monthRev>0?fmt(monthRev):'—'}</span>${monthRev>0?`<span class="cell-sub">${mDiffT>=0?'+':''}${fmt(mDiffT)} vs goal</span>`:''}</div></td>
-      <td><div class="cell-wrap"><span class="conv-main ${convCls}">${conv>0?conv.toFixed(1)+'%':'—'}</span>${conv>0&&convGoal?`<span class="cell-sub">Goal: ${convGoal}%</span>`:''}</div></td>
-      <td class="rev-cell">${revCount>0?`<div class="rev-count">${revCount}</div><div class="rev-stars">${starsHtml}</div>`:'<span class="val-muted">—</span>'}</td>
-      <td>${ytdHtml}</td>
-    `;
-    return tr;
-  }
-
-  // Build page 1 rows
-  page1Techs.forEach((t,i)=>{
-    const tr = buildRow(t, i, i+1);
-    if(tbody1) tbody1.appendChild(tr);
-  });
-
-  // Build page 2 rows — rank continues from end of page 1
-  page2Techs.forEach((t,i)=>{
-    const tr = buildRow(t, i, MAX_PAGE1 + i + 1);
-    if(tbody2) tbody2.appendChild(tr);
-  });
-
-  // Start page rotation
-  if(pageTimer) clearTimeout(pageTimer);
-  startPageRotation(allTechs.length);
+  // Start rotation
+  if (pageTimer) clearTimeout(pageTimer);
+  startPageRotation();
 }
 
 // ── INIT ──
